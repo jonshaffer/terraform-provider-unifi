@@ -16,7 +16,7 @@ func TestAccSite_basic(t *testing.T) {
 	resource.ParallelTest(t, resource.TestCase{
 		PreCheck:          func() { preCheck(t) },
 		ProviderFactories: providerFactories,
-		// FIXME causes flaky tests. See: https://github.com/paultyng/terraform-provider-unifi/issues/480
+		// FIXME causes flaky tests. See: https://github.com/jonshaffer/terraform-provider-unifi/issues/480
 		//CheckDestroy:      testAccCheckSiteResourceDestroy,
 		Steps: []resource.TestStep{
 			{
