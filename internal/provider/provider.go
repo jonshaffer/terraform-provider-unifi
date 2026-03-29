@@ -2,236 +2,124 @@ package provider
 
 import (
 	"context"
-	"fmt"
-	"strings"
+	"os"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
+	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/provider"
+	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/jonshaffer/go-unifi/unifi"
 )
 
-func init() {
-	schema.DescriptionKind = schema.StringMarkdown
+var _ provider.Provider = &UnifiProvider{}
 
-	schema.SchemaDescriptionBuilder = func(s *schema.Schema) string {
-		desc := s.Description
-		if s.Default != nil {
-			desc += fmt.Sprintf(" Defaults to `%v`.", s.Default)
+type UnifiProvider struct {
+	version string
+	client  *unifi.Client
+	site    string
+}
+
+type UnifiProviderModel struct {
+	APIKey   types.String `tfsdk:"api_key"`
+	BaseURL  types.String `tfsdk:"base_url"`
+	Site     types.String `tfsdk:"site"`
+	Insecure types.Bool   `tfsdk:"insecure"`
+}
+
+func New(version string) func() provider.Provider {
+	return func() provider.Provider {
+		return &UnifiProvider{
+			version: version,
 		}
-		if s.Deprecated != "" {
-			desc += " " + s.Deprecated
-		}
-		return strings.TrimSpace(desc)
 	}
 }
 
-func New(version string) func() *schema.Provider {
-	return func() *schema.Provider {
-		p := &schema.Provider{
-			Schema: map[string]*schema.Schema{
-				"username": {
-					Description: "Local user name for the Unifi controller API. Can be specified with the `UNIFI_USERNAME` " +
-						"environment variable.",
-					Type:        schema.TypeString,
-					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_USERNAME", ""),
-				},
-				"password": {
-					Description: "Password for the user accessing the API. Can be specified with the `UNIFI_PASSWORD` " +
-						"environment variable.",
-					Type:        schema.TypeString,
-					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_PASSWORD", ""),
-				},
-				"api_url": {
-					Description: "URL of the controller API. Can be specified with the `UNIFI_API` environment variable. " +
-						"You should **NOT** supply the path (`/api`), the SDK will discover the appropriate paths. This is " +
-						"to support UDM Pro style API paths as well as more standard controller paths.",
+func (p *UnifiProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
+	resp.TypeName = "unifi"
+	resp.Version = p.version
+}
 
-					Type:        schema.TypeString,
-					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_API", ""),
-				},
-				"site": {
-					Description: "The site in the Unifi controller this provider will manage. Can be specified with " +
-						"the `UNIFI_SITE` environment variable. Default: `default`",
-					Type:        schema.TypeString,
-					Required:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_SITE", "default"),
-				},
-				"allow_insecure": {
-					Description: "Skip verification of TLS certificates of API requests. You may need to set this to `true` " +
-						"if you are using your local API without setting up a signed certificate. Can be specified with the " +
-						"`UNIFI_INSECURE` environment variable.",
-					Type:        schema.TypeBool,
-					Optional:    true,
-					DefaultFunc: schema.EnvDefaultFunc("UNIFI_INSECURE", false),
-				},
+func (p *UnifiProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		Description: "Manage UniFi network infrastructure declaratively.",
+		Attributes: map[string]schema.Attribute{
+			"api_key": schema.StringAttribute{
+				Description: "UniFi API key. Can also be set via UNIFI_API_KEY environment variable.",
+				Optional:    true,
+				Sensitive:   true,
 			},
-			DataSourcesMap: map[string]*schema.Resource{
-				"unifi_ap_group":       dataAPGroup(),
-				"unifi_network":        dataNetwork(),
-				"unifi_port_profile":   dataPortProfile(),
-				"unifi_radius_profile": dataRADIUSProfile(),
-				"unifi_user_group":     dataUserGroup(),
-				"unifi_user":           dataUser(),
-				"unifi_account":        dataAccount(),
+			"base_url": schema.StringAttribute{
+				Description: "UniFi controller base URL (e.g., https://192.168.1.1). Can also be set via UNIFI_BASE_URL.",
+				Optional:    true,
 			},
-			ResourcesMap: map[string]*schema.Resource{
-				// TODO: "unifi_ap_group"
-				"unifi_device":         resourceDevice(),
-				"unifi_dynamic_dns":    resourceDynamicDNS(),
-				"unifi_firewall_group": resourceFirewallGroup(),
-				"unifi_firewall_rule":  resourceFirewallRule(),
-				"unifi_network":        resourceNetwork(),
-				"unifi_port_forward":   resourcePortForward(),
-				"unifi_port_profile":   resourcePortProfile(),
-				"unifi_radius_profile": resourceRadiusProfile(),
-				"unifi_site":           resourceSite(),
-				"unifi_static_route":   resourceStaticRoute(),
-				"unifi_user_group":     resourceUserGroup(),
-				"unifi_user":           resourceUser(),
-				"unifi_wlan":           resourceWLAN(),
-				"unifi_account":        resourceAccount(),
-
-				"unifi_setting_mgmt":   resourceSettingMgmt(),
-				"unifi_setting_radius": resourceSettingRadius(),
-				"unifi_setting_usg":    resourceSettingUsg(),
+			"site": schema.StringAttribute{
+				Description: "UniFi site name. Defaults to 'default'. Can also be set via UNIFI_SITE.",
+				Optional:    true,
 			},
-		}
-
-		p.ConfigureContextFunc = configure(version, p)
-		return p
+			"insecure": schema.BoolAttribute{
+				Description: "Skip TLS certificate verification. Defaults to true for self-signed certs.",
+				Optional:    true,
+			},
+		},
 	}
 }
 
-func configure(version string, p *schema.Provider) schema.ConfigureContextFunc {
-	return func(ctx context.Context, d *schema.ResourceData) (interface{}, diag.Diagnostics) {
-		user := d.Get("username").(string)
-		pass := d.Get("password").(string)
-		baseURL := d.Get("api_url").(string)
-		site := d.Get("site").(string)
-		insecure := d.Get("allow_insecure").(bool)
-
-		c := &client{
-			c: &lazyClient{
-				user:     user,
-				pass:     pass,
-				baseURL:  baseURL,
-				insecure: insecure,
-			},
-			site: site,
-		}
-
-		return c, nil
+func (p *UnifiProvider) Configure(ctx context.Context, req provider.ConfigureRequest, resp *provider.ConfigureResponse) {
+	var config UnifiProviderModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &config)...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
+
+	apiKey := envOrValue(config.APIKey, "UNIFI_API_KEY")
+	baseURL := envOrValue(config.BaseURL, "UNIFI_BASE_URL")
+	site := envOrValue(config.Site, "UNIFI_SITE")
+	insecure := true
+	if !config.Insecure.IsNull() {
+		insecure = config.Insecure.ValueBool()
+	}
+
+	if apiKey == "" {
+		resp.Diagnostics.AddError("Missing API Key", "api_key must be set in provider config or UNIFI_API_KEY environment variable")
+		return
+	}
+	if baseURL == "" {
+		resp.Diagnostics.AddError("Missing Base URL", "base_url must be set in provider config or UNIFI_BASE_URL environment variable")
+		return
+	}
+	if site == "" {
+		site = "default"
+	}
+
+	client, err := unifi.NewClient(unifi.ClientConfig{
+		BaseURL:  baseURL,
+		APIKey:   apiKey,
+		Insecure: insecure,
+	})
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to create UniFi client", err.Error())
+		return
+	}
+
+	p.client = client
+	p.site = site
+
+	resp.DataSourceData = p
+	resp.ResourceData = p
 }
 
-type unifiClient interface {
-	Version() string
-
-	ListUserGroup(ctx context.Context, site string) ([]unifi.UserGroup, error)
-	DeleteUserGroup(ctx context.Context, site, id string) error
-	CreateUserGroup(ctx context.Context, site string, d *unifi.UserGroup) (*unifi.UserGroup, error)
-	GetUserGroup(ctx context.Context, site, id string) (*unifi.UserGroup, error)
-	UpdateUserGroup(ctx context.Context, site string, d *unifi.UserGroup) (*unifi.UserGroup, error)
-
-	ListFirewallGroup(ctx context.Context, site string) ([]unifi.FirewallGroup, error)
-	DeleteFirewallGroup(ctx context.Context, site, id string) error
-	CreateFirewallGroup(ctx context.Context, site string, d *unifi.FirewallGroup) (*unifi.FirewallGroup, error)
-	GetFirewallGroup(ctx context.Context, site, id string) (*unifi.FirewallGroup, error)
-	UpdateFirewallGroup(ctx context.Context, site string, d *unifi.FirewallGroup) (*unifi.FirewallGroup, error)
-
-	ListFirewallRule(ctx context.Context, site string) ([]unifi.FirewallRule, error)
-	DeleteFirewallRule(ctx context.Context, site, id string) error
-	CreateFirewallRule(ctx context.Context, site string, d *unifi.FirewallRule) (*unifi.FirewallRule, error)
-	GetFirewallRule(ctx context.Context, site, id string) (*unifi.FirewallRule, error)
-	UpdateFirewallRule(ctx context.Context, site string, d *unifi.FirewallRule) (*unifi.FirewallRule, error)
-
-	ListWLANGroup(ctx context.Context, site string) ([]unifi.WLANGroup, error)
-
-	ListAPGroup(ctx context.Context, site string) ([]unifi.APGroup, error)
-
-	DeleteNetwork(ctx context.Context, site, id, name string) error
-	CreateNetwork(ctx context.Context, site string, d *unifi.Network) (*unifi.Network, error)
-	GetNetwork(ctx context.Context, site, id string) (*unifi.Network, error)
-	ListNetwork(ctx context.Context, site string) ([]unifi.Network, error)
-	UpdateNetwork(ctx context.Context, site string, d *unifi.Network) (*unifi.Network, error)
-
-	DeleteWLAN(ctx context.Context, site, id string) error
-	CreateWLAN(ctx context.Context, site string, d *unifi.WLAN) (*unifi.WLAN, error)
-	GetWLAN(ctx context.Context, site, id string) (*unifi.WLAN, error)
-	UpdateWLAN(ctx context.Context, site string, d *unifi.WLAN) (*unifi.WLAN, error)
-
-	GetDevice(ctx context.Context, site, id string) (*unifi.Device, error)
-	GetDeviceByMAC(ctx context.Context, site, mac string) (*unifi.Device, error)
-	CreateDevice(ctx context.Context, site string, d *unifi.Device) (*unifi.Device, error)
-	UpdateDevice(ctx context.Context, site string, d *unifi.Device) (*unifi.Device, error)
-	DeleteDevice(ctx context.Context, site, id string) error
-	ListDevice(ctx context.Context, site string) ([]unifi.Device, error)
-	AdoptDevice(ctx context.Context, site, mac string) error
-	ForgetDevice(ctx context.Context, site, mac string) error
-
-	GetUser(ctx context.Context, site, id string) (*unifi.User, error)
-	GetUserByMAC(ctx context.Context, site, mac string) (*unifi.User, error)
-	CreateUser(ctx context.Context, site string, d *unifi.User) (*unifi.User, error)
-	BlockUserByMAC(ctx context.Context, site, mac string) error
-	UnblockUserByMAC(ctx context.Context, site, mac string) error
-	OverrideUserFingerprint(ctx context.Context, site, mac string, devIdOveride int) error
-	UpdateUser(ctx context.Context, site string, d *unifi.User) (*unifi.User, error)
-	DeleteUserByMAC(ctx context.Context, site, mac string) error
-
-	GetPortForward(ctx context.Context, site, id string) (*unifi.PortForward, error)
-	DeletePortForward(ctx context.Context, site, id string) error
-	CreatePortForward(ctx context.Context, site string, d *unifi.PortForward) (*unifi.PortForward, error)
-	UpdatePortForward(ctx context.Context, site string, d *unifi.PortForward) (*unifi.PortForward, error)
-
-	ListRADIUSProfile(ctx context.Context, site string) ([]unifi.RADIUSProfile, error)
-	GetRADIUSProfile(ctx context.Context, site, id string) (*unifi.RADIUSProfile, error)
-	DeleteRADIUSProfile(ctx context.Context, site, id string) error
-	CreateRADIUSProfile(ctx context.Context, site string, d *unifi.RADIUSProfile) (*unifi.RADIUSProfile, error)
-	UpdateRADIUSProfile(ctx context.Context, site string, d *unifi.RADIUSProfile) (*unifi.RADIUSProfile, error)
-
-	ListAccounts(ctx context.Context, site string) ([]unifi.Account, error)
-	GetAccount(ctx context.Context, site, id string) (*unifi.Account, error)
-	DeleteAccount(ctx context.Context, site, id string) error
-	CreateAccount(ctx context.Context, site string, d *unifi.Account) (*unifi.Account, error)
-	UpdateAccount(ctx context.Context, site string, d *unifi.Account) (*unifi.Account, error)
-
-	GetSite(ctx context.Context, id string) (*unifi.Site, error)
-	ListSites(ctx context.Context) ([]unifi.Site, error)
-	CreateSite(ctx context.Context, Description string) ([]unifi.Site, error)
-	UpdateSite(ctx context.Context, Name, Description string) ([]unifi.Site, error)
-	DeleteSite(ctx context.Context, ID string) ([]unifi.Site, error)
-
-	ListPortProfile(ctx context.Context, site string) ([]unifi.PortProfile, error)
-	GetPortProfile(ctx context.Context, site, id string) (*unifi.PortProfile, error)
-	DeletePortProfile(ctx context.Context, site, id string) error
-	CreatePortProfile(ctx context.Context, site string, d *unifi.PortProfile) (*unifi.PortProfile, error)
-	UpdatePortProfile(ctx context.Context, site string, d *unifi.PortProfile) (*unifi.PortProfile, error)
-
-	ListRouting(ctx context.Context, site string) ([]unifi.Routing, error)
-	GetRouting(ctx context.Context, site, id string) (*unifi.Routing, error)
-	DeleteRouting(ctx context.Context, site, id string) error
-	CreateRouting(ctx context.Context, site string, d *unifi.Routing) (*unifi.Routing, error)
-	UpdateRouting(ctx context.Context, site string, d *unifi.Routing) (*unifi.Routing, error)
-
-	ListDynamicDNS(ctx context.Context, site string) ([]unifi.DynamicDNS, error)
-	GetDynamicDNS(ctx context.Context, site, id string) (*unifi.DynamicDNS, error)
-	DeleteDynamicDNS(ctx context.Context, site, id string) error
-	CreateDynamicDNS(ctx context.Context, site string, d *unifi.DynamicDNS) (*unifi.DynamicDNS, error)
-	UpdateDynamicDNS(ctx context.Context, site string, d *unifi.DynamicDNS) (*unifi.DynamicDNS, error)
-
-	GetSettingMgmt(ctx context.Context, id string) (*unifi.SettingMgmt, error)
-	GetSettingUsg(ctx context.Context, id string) (*unifi.SettingUsg, error)
-	UpdateSettingMgmt(ctx context.Context, site string, d *unifi.SettingMgmt) (*unifi.SettingMgmt, error)
-	UpdateSettingUsg(ctx context.Context, site string, d *unifi.SettingUsg) (*unifi.SettingUsg, error)
-
-	GetSettingRadius(ctx context.Context, id string) (*unifi.SettingRadius, error)
-	UpdateSettingRadius(ctx context.Context, site string, d *unifi.SettingRadius) (*unifi.SettingRadius, error)
+func envOrValue(v types.String, envVar string) string {
+	if !v.IsNull() && !v.IsUnknown() {
+		return v.ValueString()
+	}
+	return os.Getenv(envVar)
 }
 
-type client struct {
-	c    unifiClient
-	site string
+func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource {
+	return []func() resource.Resource{}
+}
+
+func (p *UnifiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
+	return []func() datasource.DataSource{}
 }
