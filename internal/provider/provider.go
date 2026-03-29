@@ -15,9 +15,10 @@ import (
 var _ provider.Provider = &UnifiProvider{}
 
 type UnifiProvider struct {
-	version string
-	client  *unifi.Client
-	site    string
+	version      string
+	client       *unifi.Client
+	site         string
+	capabilities *unifi.Capabilities
 }
 
 type UnifiProviderModel struct {
@@ -102,8 +103,19 @@ func (p *UnifiProvider) Configure(ctx context.Context, req provider.ConfigureReq
 		return
 	}
 
+	// Feature detection (FR-017): discover controller capabilities at configure time
+	caps, err := unifi.DetectCapabilities(client, ctx)
+	if err != nil {
+		resp.Diagnostics.AddWarning("Feature detection failed", err.Error())
+	} else {
+		if valErr := unifi.ValidateCapabilities(caps); valErr != nil {
+			resp.Diagnostics.AddWarning("Controller capability check", valErr.Error())
+		}
+	}
+
 	p.client = client
 	p.site = site
+	p.capabilities = caps
 
 	resp.DataSourceData = p
 	resp.ResourceData = p
