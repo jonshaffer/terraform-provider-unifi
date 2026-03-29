@@ -129,9 +129,15 @@ func envOrValue(v types.String, envVar string) string {
 }
 
 func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{}
+	return []func() resource.Resource{
+		NewDNSRecordResource,
+		NewNetworkResource,
+	}
 }
 
 func (p *UnifiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewDNSRecordDataSource,
+		NewNetworkDataSource,
+	}
 }
