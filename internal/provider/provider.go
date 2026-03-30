@@ -135,6 +135,7 @@ func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource 
 		NewFirewallGroupResource,
 		NewFirewallZoneResource,
 		NewFirewallPolicyResource,
+		NewFirewallPolicyOrderingResource,
 	}
 }
 
