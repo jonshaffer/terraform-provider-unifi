@@ -132,6 +132,9 @@ func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource 
 	return []func() resource.Resource{
 		NewDNSRecordResource,
 		NewNetworkResource,
+		NewFirewallGroupResource,
+		NewFirewallZoneResource,
+		NewFirewallPolicyResource,
 	}
 }
 
@@ -139,5 +142,6 @@ func (p *UnifiProvider) DataSources(_ context.Context) []func() datasource.DataS
 	return []func() datasource.DataSource{
 		NewDNSRecordDataSource,
 		NewNetworkDataSource,
+		NewFirewallZoneDataSource,
 	}
 }
