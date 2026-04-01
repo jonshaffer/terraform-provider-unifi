@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -25,10 +26,10 @@ type FirewallPolicyOrderingResource struct {
 }
 
 type FirewallPolicyOrderingModel struct {
-	ID               types.String `tfsdk:"id"`
-	SourceZoneID     types.String `tfsdk:"source_zone_id"`
+	ID                types.String `tfsdk:"id"`
+	SourceZoneID      types.String `tfsdk:"source_zone_id"`
 	DestinationZoneID types.String `tfsdk:"destination_zone_id"`
-	OrderedPolicyIDs types.List   `tfsdk:"ordered_policy_ids"`
+	OrderedPolicyIDs  types.List   `tfsdk:"ordered_policy_ids"`
 }
 
 func NewFirewallPolicyOrderingResource() resource.Resource {
@@ -82,26 +83,12 @@ func (r *FirewallPolicyOrderingResource) Create(ctx context.Context, req resourc
 		return
 	}
 
-	policyIDs, d := expandStringList(ctx, plan.OrderedPolicyIDs)
-	resp.Diagnostics.Append(d...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	srcZone := plan.SourceZoneID.ValueString()
-	dstZone := plan.DestinationZoneID.ValueString()
-
-	var ordering network.PolicyOrdering
-	ordering.OrderedPolicyIDs.BeforeSystemDefined = policyIDs
-	ordering.OrderedPolicyIDs.AfterSystemDefined = []string{}
-
-	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, ordering)
-	if err != nil {
+	if err := r.applyOrdering(ctx, plan); err != nil {
 		resp.Diagnostics.AddError("Failed to set policy ordering", err.Error())
 		return
 	}
 
-	plan.ID = types.StringValue(orderingID(srcZone, dstZone))
+	plan.ID = types.StringValue(orderingID(plan.SourceZoneID.ValueString(), plan.DestinationZoneID.ValueString()))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -115,13 +102,13 @@ func (r *FirewallPolicyOrderingResource) Read(ctx context.Context, req resource.
 	srcZone := state.SourceZoneID.ValueString()
 	dstZone := state.DestinationZoneID.ValueString()
 
+	// Use Integration API GET (works fine) to read current ordering as UUIDs.
 	ordering, err := r.app.GetPolicyOrdering(ctx, srcZone, dstZone)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to read policy ordering", err.Error())
 		return
 	}
 
-	// Map beforeSystemDefined back to the flat ordered_policy_ids list
 	policyIDs, _ := types.ListValueFrom(ctx, types.StringType, ordering.OrderedPolicyIDs.BeforeSystemDefined)
 	state.OrderedPolicyIDs = policyIDs
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -134,26 +121,12 @@ func (r *FirewallPolicyOrderingResource) Update(ctx context.Context, req resourc
 		return
 	}
 
-	policyIDs, d := expandStringList(ctx, plan.OrderedPolicyIDs)
-	resp.Diagnostics.Append(d...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	srcZone := plan.SourceZoneID.ValueString()
-	dstZone := plan.DestinationZoneID.ValueString()
-
-	var ordering network.PolicyOrdering
-	ordering.OrderedPolicyIDs.BeforeSystemDefined = policyIDs
-	ordering.OrderedPolicyIDs.AfterSystemDefined = []string{}
-
-	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, ordering)
-	if err != nil {
+	if err := r.applyOrdering(ctx, plan); err != nil {
 		resp.Diagnostics.AddError("Failed to update policy ordering", err.Error())
 		return
 	}
 
-	plan.ID = types.StringValue(orderingID(srcZone, dstZone))
+	plan.ID = types.StringValue(orderingID(plan.SourceZoneID.ValueString(), plan.DestinationZoneID.ValueString()))
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -175,6 +148,89 @@ func (r *FirewallPolicyOrderingResource) ImportState(ctx context.Context, req re
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("destination_zone_id"), types.StringValue(parts[1]))...)
 }
 
+// applyOrdering translates Integration API UUIDs to v2 MongoDB ObjectIDs
+// and calls the v2 batch-reorder endpoint (the only working write endpoint).
+func (r *FirewallPolicyOrderingResource) applyOrdering(ctx context.Context, plan FirewallPolicyOrderingModel) error {
+	policyUUIDs, d := expandStringList(ctx, plan.OrderedPolicyIDs)
+	if d.HasError() {
+		return fmt.Errorf("expanding policy IDs: %s", d.Errors())
+	}
+
+	srcZoneUUID := plan.SourceZoneID.ValueString()
+	dstZoneUUID := plan.DestinationZoneID.ValueString()
+
+	// Build UUID → MongoDB _id map by listing from both APIs and matching by name.
+	integrationPolicies, err := r.app.ListFirewallPolicies(ctx)
+	if err != nil {
+		return fmt.Errorf("listing integration API policies: %w", err)
+	}
+	v2Policies, err := r.app.ListFirewallPoliciesV2(ctx)
+	if err != nil {
+		return fmt.Errorf("listing v2 policies: %w", err)
+	}
+
+	// Map Integration API name → UUID
+	nameToUUID := make(map[string]string, len(integrationPolicies))
+	for _, p := range integrationPolicies {
+		nameToUUID[p.Name] = p.ID
+	}
+
+	// Map UUID → v2 _id (via name)
+	uuidToInternalID := make(map[string]string)
+	// Also collect zone UUID → v2 zone _id mapping from v2 policy data.
+	zoneUUIDToInternalID := make(map[string]string)
+	for _, v2p := range v2Policies {
+		if uuid, ok := nameToUUID[v2p.Name]; ok {
+			uuidToInternalID[uuid] = v2p.ID
+
+			// The v2 policy includes zone _ids in source/destination.
+			// Find the matching Integration API policy to get zone UUIDs.
+			for _, ip := range integrationPolicies {
+				if ip.Name == v2p.Name {
+					if v2p.Source.ZoneID != "" {
+						zoneUUIDToInternalID[ip.Source.ZoneID] = v2p.Source.ZoneID
+					}
+					if v2p.Destination.ZoneID != "" {
+						zoneUUIDToInternalID[ip.Destination.ZoneID] = v2p.Destination.ZoneID
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Translate zone UUIDs to v2 _ids.
+	srcZoneInternal, ok := zoneUUIDToInternalID[srcZoneUUID]
+	if !ok {
+		return fmt.Errorf("could not find v2 internal ID for source zone %s", srcZoneUUID)
+	}
+	dstZoneInternal, ok := zoneUUIDToInternalID[dstZoneUUID]
+	if !ok {
+		return fmt.Errorf("could not find v2 internal ID for destination zone %s", dstZoneUUID)
+	}
+
+	// Translate policy UUIDs to v2 _ids in order.
+	internalIDs := make([]string, len(policyUUIDs))
+	for i, uuid := range policyUUIDs {
+		internalID, ok := uuidToInternalID[uuid]
+		if !ok {
+			return fmt.Errorf("could not find v2 internal ID for policy %s", uuid)
+		}
+		internalIDs[i] = internalID
+	}
+
+	// All user-defined policies go in before_predefined_ids.
+	return r.app.BatchReorderPolicies(ctx, network.BatchReorderRequest{
+		BeforePredefinedIDs: internalIDs,
+		AfterPredefinedIDs:  []string{},
+		SourceZoneID:        srcZoneInternal,
+		DestinationZoneID:   dstZoneInternal,
+	})
+}
+
 func orderingID(srcZoneID, dstZoneID string) string {
 	return srcZoneID + "/" + dstZoneID
 }
+
+// Ensure sort is available (used for potential future ordering verification).
+var _ = sort.Strings
