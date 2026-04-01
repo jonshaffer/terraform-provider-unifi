@@ -45,7 +45,10 @@ func TestFirewallPolicyOrdering_basic(t *testing.T) {
 				ids = []string{}
 			}
 			json.NewEncoder(w).Encode(map[string]any{
-				"orderedFirewallPolicyIds": ids,
+				"orderedFirewallPolicyIds": map[string]any{
+					"beforeSystemDefined": ids,
+					"afterSystemDefined":  []string{},
+				},
 			})
 
 		case http.MethodPut:
@@ -53,12 +56,14 @@ func TestFirewallPolicyOrdering_basic(t *testing.T) {
 			var req map[string]any
 			json.Unmarshal(body, &req)
 
-			if policyIDs, ok := req["orderedFirewallPolicyIds"].([]any); ok {
-				ids := make([]string, len(policyIDs))
-				for i, id := range policyIDs {
-					ids[i], _ = id.(string)
+			if outer, ok := req["orderedFirewallPolicyIds"].(map[string]any); ok {
+				if before, ok := outer["beforeSystemDefined"].([]any); ok {
+					ids := make([]string, len(before))
+					for i, id := range before {
+						ids[i], _ = id.(string)
+					}
+					orderings[key] = ids
 				}
-				orderings[key] = ids
 			}
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]any{})

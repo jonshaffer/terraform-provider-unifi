@@ -91,9 +91,11 @@ func (r *FirewallPolicyOrderingResource) Create(ctx context.Context, req resourc
 	srcZone := plan.SourceZoneID.ValueString()
 	dstZone := plan.DestinationZoneID.ValueString()
 
-	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, network.PolicyOrdering{
-		OrderedPolicyIDs: policyIDs,
-	})
+	var ordering network.PolicyOrdering
+	ordering.OrderedPolicyIDs.BeforeSystemDefined = policyIDs
+	ordering.OrderedPolicyIDs.AfterSystemDefined = []string{}
+
+	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, ordering)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to set policy ordering", err.Error())
 		return
@@ -119,7 +121,8 @@ func (r *FirewallPolicyOrderingResource) Read(ctx context.Context, req resource.
 		return
 	}
 
-	policyIDs, _ := types.ListValueFrom(ctx, types.StringType, ordering.OrderedPolicyIDs)
+	// Map beforeSystemDefined back to the flat ordered_policy_ids list
+	policyIDs, _ := types.ListValueFrom(ctx, types.StringType, ordering.OrderedPolicyIDs.BeforeSystemDefined)
 	state.OrderedPolicyIDs = policyIDs
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
@@ -140,9 +143,11 @@ func (r *FirewallPolicyOrderingResource) Update(ctx context.Context, req resourc
 	srcZone := plan.SourceZoneID.ValueString()
 	dstZone := plan.DestinationZoneID.ValueString()
 
-	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, network.PolicyOrdering{
-		OrderedPolicyIDs: policyIDs,
-	})
+	var ordering network.PolicyOrdering
+	ordering.OrderedPolicyIDs.BeforeSystemDefined = policyIDs
+	ordering.OrderedPolicyIDs.AfterSystemDefined = []string{}
+
+	err := r.app.SetPolicyOrdering(ctx, srcZone, dstZone, ordering)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to update policy ordering", err.Error())
 		return
